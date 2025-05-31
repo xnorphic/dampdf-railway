@@ -1,3 +1,5 @@
+# File: app/core/config.py
+
 import os
 from pydantic_settings import BaseSettings
 from typing import List
@@ -17,7 +19,8 @@ class Settings(BaseSettings):
     BACKEND_CORS_ORIGINS: List[str] = [
         "http://localhost:3000",
         "http://localhost:5173",
-        "https://your-frontend-domain.com",
+        "https://dampdf-frontend.vercel.app",
+        "https://*.vercel.app",
     ]
     
     SECRET_KEY: str = os.getenv("SECRET_KEY", "dev-secret-change-in-production")
@@ -26,6 +29,9 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 50))
     TEMP_FILE_EXPIRE_HOURS: int = int(os.getenv("TEMP_FILE_EXPIRE_HOURS", 1))
     PROCESSED_FILE_EXPIRE_HOURS: int = int(os.getenv("PROCESSED_FILE_EXPIRE_HOURS", 24))
+    
+    # Rate limiting
+    FREE_TIER_RATE_LIMIT: str = os.getenv("FREE_TIER_RATE_LIMIT", "10/hour")
     
     class Config:
         env_file = ".env"
