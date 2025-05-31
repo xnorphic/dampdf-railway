@@ -1,3 +1,5 @@
+# File: app/core/exceptions.py
+
 from fastapi import HTTPException
 
 class DamPDFException(Exception):
@@ -19,3 +21,13 @@ class UnsupportedFileTypeError(DamPDFException):
     def __init__(self, file_type: str):
         message = f"File type '{file_type}' is not supported"
         super().__init__(message, "UNSUPPORTED_FILE_TYPE")
+
+class SessionExpiredError(DamPDFException):
+    def __init__(self):
+        message = "Session has expired or not found"
+        super().__init__(message, "SESSION_EXPIRED")
+
+class RateLimitExceededError(DamPDFException):
+    def __init__(self):
+        message = "Rate limit exceeded. Please try again later or upgrade your plan."
+        super().__init__(message, "RATE_LIMIT_EXCEEDED")
