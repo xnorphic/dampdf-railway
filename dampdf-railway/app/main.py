@@ -38,13 +38,15 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://dampdf-frontend.vercel.app",
+        "https://*.vercel.app",
         "http://localhost:3000",
-        "http://localhost:5173",
-        "https://your-frontend-domain.com",  # Replace with your actual domain
+        "http://localhost:5173"
     ],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+)allow_headers=["*"],
 )
 
 # Include API routes
