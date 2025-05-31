@@ -1,133 +1,154 @@
-import asyncio
-from datetime import datetime, timedelta
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+# File: app/api/api_v1/endpoints/process.py
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse
+import os
 import structlog
 
+from app.core.exceptions import DamPDFException, FileProcessingError
 from app.models.file_models import ProcessingRequest, ProcessingStatusResponse, ProcessingStatus
-from app.services.session_manager import session_manager
 from app.services.file_processor import file_processor
+from app.services.session_manager import session_manager
 from app.core.config import settings
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 router = APIRouter()
-
-async def process_file_background(session_id: str, tool_type: str, temp_path: str, filename: str, options: dict):
-    try:
-        # Update status to processing
-        await session_manager.store_session_data(
-            f"status:{session_id}",
-            {
-                "session_id": session_id,
-                "status": ProcessingStatus.PROCESSING.value,
-                "progress": 50,
-                "message": "Processing file...",
-                "started_at": datetime.now().isoformat()
-            },
-            expire_hours=1
-        )
-        
-        # Process the file
-        output_path, file_info = await file_processor.process_file(temp_path, tool_type, filename, options)
-        
-        # Store processed file info
-        processed_data = {
-            "output_path": output_path,
-            "file_info": file_info,
-            "expires_at": (datetime.now() + timedelta(hours=settings.PROCESSED_FILE_EXPIRE_HOURS)).isoformat()
-        }
-        
-        await session_manager.store_session_data(
-            f"processed:{session_id}",
-            processed_data,
-            expire_hours=settings.PROCESSED_FILE_EXPIRE_HOURS
-        )
-        
-        # Update status to completed
-        await session_manager.store_session_data(
-            f"status:{session_id}",
-            {
-                "session_id": session_id,
-                "status": ProcessingStatus.COMPLETED.value,
-                "progress": 100,
-                "message": "File processing completed",
-                "completed_at": datetime.now().isoformat()
-            },
-            expire_hours=1
-        )
-        
-        logger.info("File processing completed", session_id=session_id)
-        
-    except Exception as e:
-        logger.error("File processing failed", error=str(e), session_id=session_id)
-        
-        await session_manager.store_session_data(
-            f"status:{session_id}",
-            {
-                "session_id": session_id,
-                "status": ProcessingStatus.FAILED.value,
-                "progress": 0,
-                "error": str(e)
-            },
-            expire_hours=1
-        )
 
 @router.post("/start", response_model=ProcessingStatusResponse)
 async def start_processing(request: ProcessingRequest, background_tasks: BackgroundTasks):
     try:
+        # Get session data
         session_data = await session_manager.get_session_data(request.session_id)
         if not session_data:
-            raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(status_code=404, detail="Session not found or expired")
         
-        # Initialize processing status
+        # Update status to processing
+        session_data["status"] = ProcessingStatus.PROCESSING
+        session_data["progress"] = 10
+        session_data["message"] = "Processing started"
         await session_manager.store_session_data(
-            f"status:{request.session_id}",
-            {
-                "session_id": request.session_id,
-                "status": ProcessingStatus.QUEUED.value,
-                "progress": 0,
-                "message": "Processing queued"
-            },
-            expire_hours=1
+            request.session_id, 
+            session_data,
+            expire_hours=settings.TEMP_FILE_EXPIRE_HOURS
         )
         
-        # Start background processing
-        options = request.options or {}
+        # Get file path from session
+        input_path = session_data.get("file_path")
+        if not input_path or not os.path.exists(input_path):
+            raise HTTPException(status_code=404, detail="File not found")
         
+        # Start processing in background
         background_tasks.add_task(
             process_file_background,
             request.session_id,
+            input_path,
             request.tool_type,
-            session_data["temp_path"],
-            session_data["original_filename"],
-            options
+            session_data.get("filename", "file"),
+            request.options or {}
         )
-        
-        logger.info("Processing started", session_id=request.session_id, tool_type=request.tool_type)
         
         return ProcessingStatusResponse(
             session_id=request.session_id,
-            status=ProcessingStatus.QUEUED,
-            progress=0,
+            status=ProcessingStatus.PROCESSING,
+            progress=10,
             message="Processing started"
         )
         
     except HTTPException:
         raise
+    except DamPDFException as e:
+        logger.warning("Processing request failed", error=str(e), code=e.code)
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e), "code": e.code}
+        )
     except Exception as e:
-        logger.error("Failed to start processing", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to start processing")
+        logger.exception("Unexpected error in processing request", error=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"error": "An unexpected error occurred", "code": "INTERNAL_ERROR"}
+        )
+
+async def process_file_background(
+    session_id: str,
+    input_path: str,
+    tool_type: str,
+    original_filename: str,
+    options: dict
+):
+    try:
+        # Update status
+        session_data = await session_manager.get_session_data(session_id)
+        if not session_data:
+            logger.error("Session not found during background processing", session_id=session_id)
+            return
+        
+        session_data["progress"] = 30
+        session_data["message"] = "Processing file..."
+        await session_manager.store_session_data(
+            session_id, 
+            session_data,
+            expire_hours=settings.TEMP_FILE_EXPIRE_HOURS
+        )
+        
+        # Process the file
+        output_path, file_info = await file_processor.process_file(
+            input_path, tool_type, original_filename, options
+        )
+        
+        # Update session with result
+        session_data["status"] = ProcessingStatus.COMPLETED
+        session_data["progress"] = 100
+        session_data["message"] = "Processing complete"
+        session_data["output_path"] = output_path
+        session_data["file_info"] = file_info
+        
+        # Store session with longer expiry for processed files
+        await session_manager.store_session_data(
+            session_id, 
+            session_data,
+            expire_hours=settings.PROCESSED_FILE_EXPIRE_HOURS
+        )
+        
+        logger.info("File processing completed", session_id=session_id)
+        
+    except Exception as e:
+        logger.exception("Background processing failed", session_id=session_id, error=str(e))
+        
+        # Update session with error
+        try:
+            session_data = await session_manager.get_session_data(session_id)
+            if session_data:
+                session_data["status"] = ProcessingStatus.FAILED
+                session_data["error"] = str(e)
+                await session_manager.store_session_data(
+                    session_id, 
+                    session_data,
+                    expire_hours=settings.TEMP_FILE_EXPIRE_HOURS
+                )
+        except Exception as update_error:
+            logger.error("Failed to update session with error", error=str(update_error))
 
 @router.get("/status/{session_id}", response_model=ProcessingStatusResponse)
 async def get_processing_status(session_id: str):
     try:
-        status_data = await session_manager.get_session_data(f"status:{session_id}")
-        if not status_data:
-            raise HTTPException(status_code=404, detail="Status not found")
+        session_data = await session_manager.get_session_data(session_id)
+        if not session_data:
+            raise HTTPException(status_code=404, detail="Session not found or expired")
         
-        return ProcessingStatusResponse(**status_data)
+        return ProcessingStatusResponse(
+            session_id=session_id,
+            status=session_data.get("status", ProcessingStatus.QUEUED),
+            progress=session_data.get("progress", 0),
+            message=session_data.get("message", ""),
+            error=session_data.get("error")
+        )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Failed to get processing status", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to get status")
+        logger.exception("Error getting processing status", session_id=session_id, error=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Failed to get processing status", "code": "INTERNAL_ERROR"}
+        )
