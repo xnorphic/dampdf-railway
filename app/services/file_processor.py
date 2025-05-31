@@ -1,17 +1,20 @@
+# File: app/services/file_processor.py
+
 import os
 import tempfile
 import asyncio
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, Dict, Any
 from PIL import Image
 import fitz  # PyMuPDF
 import subprocess
 import structlog
+from fastapi.concurrency import run_in_threadpool
 
 from app.core.exceptions import FileProcessingError
 from app.models.file_models import ToolType
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 def generate_output_filename(original_name: str, target_extension: str = None) -> str:
     parts = original_name.rsplit('.', 1)
@@ -30,7 +33,7 @@ class FileProcessor:
         tool_type: ToolType, 
         original_filename: str,
         options: dict = None
-    ) -> Tuple[str, dict]:
+    ) -> Tuple[str, Dict[str, Any]]:
         try:
             logger.info("Processing file", tool_type=tool_type, filename=original_filename)
             
@@ -62,6 +65,7 @@ class FileProcessor:
                 "filename": output_filename,
                 "original_size": original_size,
                 "processed_size": processed_size,
+                "new_size": processed_size,  # Add this for frontend compatibility
                 "compression_ratio": max(0, compression_ratio),
                 "created_at": datetime.now()
             }
@@ -69,52 +73,81 @@ class FileProcessor:
             return output_path, file_info
             
         except Exception as e:
-            logger.error("File processing failed", error=str(e))
+            logger.error("File processing failed", error=str(e), exc_info=True)
             raise FileProcessingError(f"Failed to process file: {str(e)}")
     
     async def _compress_image(self, input_path: str, output_path: str, options: dict):
         quality = options.get("quality", 70)
         
-        with Image.open(input_path) as img:
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            img.save(output_path, "JPEG", quality=quality, optimize=True)
+        # Run in threadpool to avoid blocking the event loop
+        async def _process_image():
+            try:
+                with Image.open(input_path) as img:
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                    img.save(output_path, "JPEG", quality=quality, optimize=True)
+            except Exception as e:
+                logger.error("Image compression failed", error=str(e))
+                raise FileProcessingError(f"Image compression failed: {str(e)}")
+        
+        await run_in_threadpool(_process_image)
     
     async def _compress_pdf(self, input_path: str, output_path: str, options: dict):
         compression_level = options.get("compression_level", "medium")
         
-        doc = fitz.open(input_path)
+        # Run in threadpool to avoid blocking the event loop
+        async def _process_pdf():
+            try:
+                doc = fitz.open(input_path)
+                
+                # FIXED: Use proper parameters for PyMuPDF
+                if compression_level == "high":
+                    doc.save(output_path, deflate=True, garbage=4, clean=True)
+                elif compression_level == "medium":
+                    doc.save(output_path, deflate=True, garbage=3, clean=True)
+                else:
+                    doc.save(output_path, deflate=True, garbage=1, clean=True)
+                
+                doc.close()
+            except Exception as e:
+                logger.error("PDF compression failed", error=str(e))
+                raise FileProcessingError(f"PDF compression failed: {str(e)}")
         
-        if compression_level == "high":
-            deflate_level = 9
-        elif compression_level == "medium":
-            deflate_level = 6
-        else:
-            deflate_level = 3
-        
-        doc.save(output_path, deflate=True, deflate_level=deflate_level, garbage=4, clean=True)
-        doc.close()
+        await run_in_threadpool(_process_pdf)
     
     async def _convert_docx_to_pdf(self, input_path: str, output_path: str):
         output_dir = os.path.dirname(output_path)
         
-        cmd = ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", output_dir, input_path]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
-        
-        if process.returncode != 0:
-            raise FileProcessingError(f"LibreOffice conversion failed: {stderr.decode()}")
-        
-        generated_file = os.path.join(output_dir, os.path.splitext(os.path.basename(input_path))[0] + ".pdf")
-        
-        if os.path.exists(generated_file):
-            os.rename(generated_file, output_path)
-        else:
-            raise FileProcessingError("Converted file not found")
+        try:
+            cmd = ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", output_dir, input_path]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+            except asyncio.TimeoutError:
+                process.kill()
+                raise FileProcessingError("Document conversion timed out after 60 seconds")
+            
+            if process.returncode != 0:
+                error_msg = stderr.decode() if stderr else "Unknown conversion error"
+                logger.error("LibreOffice conversion failed", error=error_msg)
+                raise FileProcessingError(f"Document conversion failed: {error_msg}")
+            
+            generated_file = os.path.join(output_dir, os.path.splitext(os.path.basename(input_path))[0] + ".pdf")
+            
+            if os.path.exists(generated_file):
+                os.rename(generated_file, output_path)
+            else:
+                raise FileProcessingError("Converted file not found")
+                
+        except FileProcessingError:
+            raise
+        except Exception as e:
+            logger.error("Document conversion failed", error=str(e))
+            raise FileProcessingError(f"Document conversion failed: {str(e)}")
     
     async def _convert_xlsx_to_pdf(self, input_path: str, output_path: str):
         # Same as DOCX conversion
